@@ -1,16 +1,303 @@
 import os
 import numpy as np
-from flask import Flask, render_template, request, send_from_directory
-from tensorflow.keras.models import load_model
+import secrets
+import time
+from datetime import datetime, timedelta
+from io import BytesIO
+from flask import Flask, render_template, request, send_from_directory, redirect, url_for, send_file
+from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
+from flask_sqlalchemy import SQLAlchemy
 from tensorflow.keras.preprocessing import image
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, Table, TableStyle, PageBreak, HRFlowable
+from reportlab.lib import colors
 
-# ---------------- Flask App ----------------
+# Suppress TF warnings BEFORE importing model_loader
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Import model_loader which applies patches
+from model_loader import load_model
+
+# ----------------Flask App ----------------
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['SECRET_KEY'] = 'your_secret_key_change_this'  # Change this to a random secret key
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{os.path.abspath("users.db")}'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# ---------------- Load Model ----------------
-model = load_model('hypervision_OPG_model.h5', compile=False)
+# Add cache control to prevent form resubmission issues
+@app.after_request
+def add_header(response):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+# Error handler for 405 Method Not Allowed
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return redirect(url_for('index'))
+
+# ----------------Database ----------------
+db = SQLAlchemy(app)
+
+# ----------------User Model ----------------
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    mobile = db.Column(db.String(20), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    scans = db.relationship('ScanHistory', backref='user', lazy=True, cascade='all, delete-orphan')
+
+# ----------------ScanHistory Model ----------------
+class ScanHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    prediction = db.Column(db.String(80), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.now)
+    image_path = db.Column(db.String(255), nullable=False)
+    # Store probabilities as JSON string
+    caries_prob = db.Column(db.Float, default=0.0)
+    decayed_prob = db.Column(db.Float, default=0.0)
+    ectopic_prob = db.Column(db.Float, default=0.0)
+    healthy_prob = db.Column(db.Float, default=0.0)
+
+# ----------------Login Manager ----------------
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# ----------------OTP and Password Reset Storage ----------------
+# Stores OTP with format: {username: {'otp': otp_code, 'mobile': mobile_number, 'expiration': expiration_time}}
+otp_storage = {}
+# Stores password reset tokens with format: {token: {'username': username, 'expiration': expiration_time}}
+password_reset_tokens = {}
+OTP_EXPIRATION_MINUTES = 10  # OTP expires in 10 minutes
+TOKEN_EXPIRATION_MINUTES = 30  # Token expires in 30 minutes
+
+def validate_username_format(username):
+    """
+    Validate username follows DOCT format:
+    - Starts with 'DOCT'
+    - Followed by exactly 8 digits
+    - Example: DOCT12345678
+    """
+    import re
+    pattern = r'^DOCT\d{8}$'
+    return re.match(pattern, str(username)) is not None
+
+def generate_otp():
+    """Generate a 6-digit OTP"""
+    return str(secrets.randbelow(999999)).zfill(6)
+
+def format_phone_number(phone_number):
+    """
+    Format phone number to E.164 format required by Twilio Verify API.
+    E.164 format: +<country_code><number> (e.g., +918248564527)
+    
+    If phone number doesn't start with +, assume it's Indian (+91)
+    """
+    # Remove any spaces, dashes, or special characters
+    cleaned = ''.join(c for c in str(phone_number) if c.isdigit() or c == '+')
+    
+    # If already starts with +, assume it's correctly formatted
+    if cleaned.startswith('+'):
+        return cleaned
+    
+    # If it starts with country code (91 for India), add +
+    if cleaned.startswith('91') and len(cleaned) >= 12:
+        return '+' + cleaned
+    
+    # If it's 10 digits (Indian local format), prepend +91
+    if len(cleaned) == 10:
+        return '+91' + cleaned
+    
+    # Otherwise, return as-is with + prefix (caller may need to verify)
+    return '+' + cleaned
+
+def send_otp_sms(mobile_number, otp):
+    """
+    Send OTP via SMS using Twilio Verify API
+    
+    Twilio Verify handles OTP generation and delivery.
+    Requires environment variables:
+    - TWILIO_ACCOUNT_SID
+    - TWILIO_AUTH_TOKEN
+    - TWILIO_VERIFY_SERVICE_ID
+    
+    Returns: True if sent successfully, False otherwise
+    """
+    # Format phone number to E.164 format (required by Twilio)
+    formatted_mobile = format_phone_number(mobile_number)
+    
+    # Get Twilio credentials from environment variables
+    TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+    TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+    TWILIO_VERIFY_SERVICE_ID = os.environ.get('TWILIO_VERIFY_SERVICE_ID', '').strip()
+    
+    # Check if credentials are configured
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_VERIFY_SERVICE_ID:
+        # Development mode: print to console
+        print(f"\n{'='*70}")
+        print(f"[DEV MODE] OTP SENT TO: {mobile_number} (formatted: {formatted_mobile})")
+        print(f"[DEV MODE] OTP CODE: {otp}")
+        print(f"[DEV MODE] Valid for 10 minutes")
+        print(f"{'='*70}\n")
+        
+        # Still log that credentials are missing
+        print(f"⚠️  NOTE: To send real SMS, configure .env file with Twilio Verify credentials")
+        print(f"   See .env.example for setup instructions\n")
+        
+        return True
+    
+    # Production mode: Send via Twilio Verify API
+    try:
+        from twilio.rest import Client
+        
+        # Initialize Twilio client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Send OTP via Twilio Verify API with formatted phone number
+        verification = client.verify.v2.services(TWILIO_VERIFY_SERVICE_ID).verifications.create(
+            to=formatted_mobile,
+            channel='sms'
+        )
+        
+        # Store verification SID for later verification
+        otp_storage[mobile_number] = {
+            'verification_sid': verification.sid,
+            'expiration': time.time() + (OTP_EXPIRATION_MINUTES * 60)
+        }
+        
+        print(f"✓ SMS OTP sent successfully to {formatted_mobile}")
+        print(f"  Verification SID: {verification.sid}")
+        print(f"  Status: {verification.status}")
+        return True
+        
+    except ImportError:
+        print(f"✗ ERROR: Twilio module not found")
+        print(f"  Install with: pip install twilio")
+        return False
+        
+    except Exception as e:
+        print(f"✗ ERROR sending OTP via Twilio Verify: {str(e)}")
+        return False
+
+def store_otp(username, mobile_number):
+    """Store mobile number for OTP verification"""
+    # For Twilio Verify, we don't need to generate OTP ourselves
+    # Twilio handles it. We just store the mobile number.
+    otp_storage[username] = {
+        'mobile': mobile_number,
+        'expiration': time.time() + (OTP_EXPIRATION_MINUTES * 60)
+    }
+    return None  # Twilio generates the OTP
+
+def check_otp(username, otp_entered):
+    """Verify OTP against Twilio Verify API"""
+    if username not in otp_storage:
+        return False, "No OTP request found"
+    
+    otp_data = otp_storage[username]
+    
+    if time.time() > otp_data['expiration']:
+        del otp_storage[username]
+        return False, "OTP expired. Please request a new one."
+    
+    # Get Twilio credentials
+    TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID', '').strip()
+    TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN', '').strip()
+    TWILIO_VERIFY_SERVICE_ID = os.environ.get('TWILIO_VERIFY_SERVICE_ID', '').strip()
+    
+    # Development mode: simple verification
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_VERIFY_SERVICE_ID:
+        # In dev mode, accept any 6-digit code
+        if len(str(otp_entered)) == 6 and str(otp_entered).isdigit():
+            return True, "OTP verified successfully (DEV MODE)"
+        else:
+            return False, "Invalid OTP format. Please enter 6 digits."
+    
+    # Production mode: verify against Twilio
+    try:
+        from twilio.rest import Client
+        
+        mobile = otp_data['mobile']
+        formatted_mobile = format_phone_number(mobile)
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Verify the code with Twilio using formatted number
+        verification_check = client.verify.v2.services(TWILIO_VERIFY_SERVICE_ID).verification_checks.create(
+            to=formatted_mobile,
+            code=str(otp_entered)
+        )
+        
+        if verification_check.status == 'approved':
+            print(f"✓ OTP verified successfully for {formatted_mobile}")
+            del otp_storage[username]
+            return True, "OTP verified successfully"
+        else:
+            return False, f"OTP verification failed: {verification_check.status}"
+            
+    except Exception as e:
+        print(f"✗ ERROR verifying OTP with Twilio: {str(e)}")
+        return False, f"Verification error: {str(e)}"
+
+def generate_reset_token(username):
+    """Generate a unique reset token for password recovery"""
+    token = secrets.token_urlsafe(32)
+    expiration = time.time() + (TOKEN_EXPIRATION_MINUTES * 60)
+    password_reset_tokens[token] = {
+        'username': username,
+        'expiration': expiration
+    }
+    return token
+
+def verify_reset_token(token):
+    """Verify if a reset token is valid and not expired"""
+    if token not in password_reset_tokens:
+        return None
+    
+    token_data = password_reset_tokens[token]
+    if time.time() > token_data['expiration']:
+        # Token expired, remove it
+        del password_reset_tokens[token]
+        return None
+    
+    return token_data['username']
+
+# ----------------Initialize Database ----------------
+with app.app_context():
+    db.create_all()
+
+# ----------------Load Model ----------------
+print("Loading Main Diagnosis Model...")
+model = load_model('hypervision_OPG_model.h5')
+print("Model loaded successfully!")
+
+print("Loading Validation Identity Model (MobileNetV2)...")
+try:
+    # 224x224 because MobileNetV2 was trained on it
+    ood_model = MobileNetV2(input_shape=(224, 224, 3), include_top=False, weights='imagenet', pooling='avg')
+    opg_center = np.load('opg_center.npy')
+    VALIDATION_ACTIVE = True
+    print("OOD validation active.")
+except Exception as e:
+    print(f"OOD validation disabled (Missing opg_center.npy or network error). Error: {e}")
+    VALIDATION_ACTIVE = False
 
 # ---------------- Model Settings ----------------
 img_size = (299, 299)
@@ -25,13 +312,206 @@ class_dict = {
 classes = list(class_dict.values())
 
 # ---------------- Serve Uploaded Images ----------------
-@app.route('/uploads/<filename>')
+@app.route('/uploads/<filename>', methods=['GET'])
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# ---------------- Main Route ----------------
-@app.route('/', methods=['GET', 'POST'])
+# ----------------Login Route ----------------
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        user = User.query.filter_by(username=username).first()
+        
+        if user and check_password_hash(user.password, password):
+            login_user(user)
+            return redirect(url_for('index'))
+        else:
+            return render_template('login.html', error='Invalid username or password')
+    
+    return render_template('login.html')
+
+# ----------------Signup Route ----------------
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        mobile = request.form.get('mobile')
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validation
+        if not username or not mobile or not password or not confirm_password:
+            return render_template('signup.html', error='All fields are required')
+        
+        if not validate_username_format(username):
+            return render_template('signup.html', error='Username must follow format: DOCT + 8 digits (e.g., DOCT12345678)')
+        
+        if len(mobile) < 10:
+            return render_template('signup.html', error='Please enter a valid mobile number')
+        
+        if len(password) < 6:
+            return render_template('signup.html', error='Password must be at least 6 characters')
+        
+        if password != confirm_password:
+            return render_template('signup.html', error='Passwords do not match')
+        
+        # Check if user already exists
+        existing_user = User.query.filter_by(username=username).first()
+        if existing_user:
+            return render_template('signup.html', error='Username already exists')
+        
+        # Check if mobile already exists
+        existing_mobile = User.query.filter_by(mobile=mobile).first()
+        if existing_mobile:
+            return render_template('signup.html', error='This mobile number is already registered')
+        
+        # Create new user
+        new_user = User(username=username, mobile=mobile, password=generate_password_hash(password))
+        db.session.add(new_user)
+        db.session.commit()
+        
+        return redirect(url_for('login'))
+    
+    return render_template('signup.html')
+
+# ----------------Forgot Password Route (OTP Based) ----------------
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        mobile = request.form.get('mobile')
+        
+        # Check if user exists
+        user = User.query.filter_by(username=username).first()
+        
+        if not user:
+            # For security, don't reveal if username exists
+            return render_template('forgot_password.html', 
+                                 error='Username or mobile number not found')
+        
+        # Verify mobile number matches
+        if user.mobile != mobile:
+            return render_template('forgot_password.html',
+                                 error='Mobile number does not match the registered number')
+        
+        # Store OTP data and send OTP via Twilio Verify
+        store_otp(username, mobile)
+        otp_sent = send_otp_sms(mobile, None)
+        
+        if not otp_sent:
+            return render_template('forgot_password.html',
+                                 error='Failed to send OTP. Please try again.')
+        
+        # Redirect to OTP verification page
+        return redirect(url_for('verify_otp', username=username))
+    
+    return render_template('forgot_password.html')
+
+# ----------------OTP Verification Route ----------------
+@app.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    username = request.args.get('username') or request.form.get('username')
+    
+    if not username:
+        return render_template('forgot_password.html', error='Invalid request. Please start over.')
+    
+    if request.method == 'POST':
+        otp_entered = request.form.get('otp')
+        
+        if not otp_entered:
+            return render_template('otp_verification.html',
+                                 username=username,
+                                 error='Please enter the OTP')
+        
+        # Verify OTP
+        is_valid, message = check_otp(username, otp_entered)
+        
+        if not is_valid:
+            return render_template('otp_verification.html',
+                                 username=username,
+                                 error=message)
+        
+        # OTP verified, generate reset token and redirect to password reset
+        token = generate_reset_token(username)
+        return redirect(url_for('reset_password', token=token))
+    
+    return render_template('otp_verification.html', username=username)
+
+# ----------------Reset Password Route ----------------
+@app.route('/reset-password', methods=['GET', 'POST'])
+def reset_password():
+    token = request.args.get('token') or request.form.get('token')
+    
+    if not token:
+        return render_template('forgot_password.html', error='No token provided. Request a new password reset.')
+    
+    username = verify_reset_token(token)
+    
+    if not username:
+        return render_template('forgot_password.html', error='Invalid or expired token. Please request a new password reset.')
+    
+    if request.method == 'POST':
+        new_password = request.form.get('new_password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validation
+        if not new_password or not confirm_password:
+            return render_template('reset_password.html', 
+                                 token=token,
+                                 error='All fields are required')
+        
+        if len(new_password) < 6:
+            return render_template('reset_password.html',
+                                 token=token,
+                                 error='Password must be at least 6 characters')
+        
+        if new_password != confirm_password:
+            return render_template('reset_password.html',
+                                 token=token,
+                                 error='Passwords do not match')
+        
+        # Get user to check old password
+        user = User.query.filter_by(username=username).first()
+        if user:
+            # Check if new password is the same as old password
+            if check_password_hash(user.password, new_password):
+                return render_template('reset_password.html',
+                                     token=token,
+                                     error='New password cannot be the same as your old password. Please create a different password.')
+            
+            # Update user password
+            user.password = generate_password_hash(new_password)
+            db.session.commit()
+            
+            # Remove used token
+            if token in password_reset_tokens:
+                del password_reset_tokens[token]
+            
+            return redirect(url_for('login'))
+    
+    
+    return render_template('reset_password.html', token=token)
+
+# ----------------Logout Route ----------------
+@app.route('/logout', methods=['GET', 'POST'])
+@login_required
+def logout():
+    logout_user()
+    return redirect(url_for('login'))
+
+# ----------------Main Route ----------------
+@app.route('/', methods=['GET'])
+@login_required
 def index():
+    return render_template('index.html')
+
+# ----------------Upload & Analyze Route ----------------
+@app.route('/upload', methods=['GET', 'POST'])
+@login_required
+def upload():
     prediction_label = None
     class_prob_pairs = None
     image_path = None
@@ -50,21 +530,348 @@ def index():
             img_array = np.expand_dims(img_array, axis=0)
             img_array = img_array / 255.0
 
+            # ----- Validation Verification (AI-based OOD Detection) -----
+            is_invalid = False
+            
+            # First layer defense: Basic color and brightness checks
+            color_std_mean = np.mean(np.std(img_array[0], axis=-1))
+            img_gray = np.mean(img_array[0], axis=-1)
+            img_mean = np.mean(img_gray)
+            
+            if color_std_mean > 0.05 or img_mean > 0.90:
+                is_invalid = True
+                
+            # Second layer defense: Deep embedding signature check
+            if not is_invalid and VALIDATION_ACTIVE:
+                # Load image specifically for MobileNetV2 (needs 224x224 RGB)
+                val_img = image.load_img(save_path, target_size=(224, 224))
+                val_x = image.img_to_array(val_img)
+                val_x = np.expand_dims(val_x, axis=0)
+                val_x = preprocess_input(val_x)
+                
+                # Extract features
+                features = ood_model.predict(val_x, verbose=0)
+                
+                # Calculate distance from known OPG centroid profile
+                dist = np.linalg.norm(features[0] - opg_center)
+                
+                # If distance > 25.0, image structure is alien to an OPG scan (graphs trigger ~27+)
+                if dist > 25.0:
+                    is_invalid = True
+            
             # ----- Prediction -----
             preds = model.predict(img_array)
-            class_index = np.argmax(preds, axis=1)[0]
-            prediction_label = classes[class_index]
+            max_confidence = np.max(preds[0])
 
-            class_prob_pairs = list(zip(classes, preds[0]))
+            if is_invalid or max_confidence < 0.45:
+                prediction_label = "Invalid Image: Not a valid Teeth OPG Scan"
+                class_prob_pairs = []
+                image_path = f"/uploads/{filename}"
+                
+                # We don't save invalid scans to the user's history
+            else:
+                class_index = np.argmax(preds, axis=1)[0]
+                prediction_label = classes[class_index]
 
-            # IMPORTANT: browser-accessible URL
-            image_path = f"/uploads/{filename}"
+                class_prob_pairs = list(zip(classes, preds[0]))
+
+                # IMPORTANT: browser-accessible URL
+                image_path = f"/uploads/{filename}"
+                
+                # Save to scan history with probabilities
+                scan = ScanHistory(
+                    user_id=current_user.id,
+                    filename=filename,
+                    prediction=prediction_label,
+                    image_path=image_path,
+                    caries_prob=float(preds[0][0]) * 100,
+                    decayed_prob=float(preds[0][1]) * 100,
+                    ectopic_prob=float(preds[0][2]) * 100,
+                    healthy_prob=float(preds[0][3]) * 100
+                )
+                db.session.add(scan)
+                db.session.commit()
 
     return render_template(
-        'index.html',
+        'upload.html',
         prediction=prediction_label,
         class_prob_pairs=class_prob_pairs,
         image_path=image_path
+    )
+
+# ----------------Scan History Route ----------------
+@app.route('/scan-history', methods=['GET'])
+@login_required
+def scan_history():
+    scans = ScanHistory.query.filter_by(user_id=current_user.id).order_by(ScanHistory.timestamp.desc()).all()
+    return render_template('scan_history.html', scans=scans)
+
+# ----------------Model Info Route ----------------
+@app.route('/model-info', methods=['GET'])
+@login_required
+def model_info():
+    return render_template('model_info.html')
+
+# ----------------About Route ----------------
+@app.route('/about', methods=['GET'])
+@login_required
+def about():
+    return render_template('about.html')
+
+# ----------------Download Scan Report as PDF ----------------
+# Helper function for confidence bar representation
+def _get_confidence_bar(percentage):
+    filled = int(percentage / 10)  # 10 blocks for 100%
+    empty = 10 - filled
+    return '█' * filled + '░' * empty
+
+@app.route('/download-report/<int:scan_id>', methods=['GET'])
+@login_required
+def download_report(scan_id):
+    scan = ScanHistory.query.get_or_404(scan_id)
+    
+    # Check if user owns this scan
+    if scan.user_id != current_user.id:
+        return redirect(url_for('scan_history'))
+    
+    # Create PDF
+    pdf_buffer = BytesIO()
+    doc = SimpleDocTemplate(pdf_buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch, leftMargin=0.5*inch, rightMargin=0.5*inch)
+    
+    # Styles
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=28,
+        textColor=colors.HexColor('#0f172a'),
+        spaceAfter=6,
+        alignment=1,
+        fontName='Helvetica-Bold'
+    )
+    
+    subtitle_style = ParagraphStyle(
+        'SubTitle',
+        parent=styles['Normal'],
+        fontSize=11,
+        textColor=colors.HexColor('#64748b'),
+        spaceAfter=18,
+        alignment=1,
+        fontName='Helvetica'
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=12,
+        textColor=colors.HexColor('#1e293b'),
+        spaceAfter=10,
+        spaceBefore=12,
+        fontName='Helvetica-Bold',
+        borderColor=colors.HexColor('#4facfe'),
+        borderWidth=2,
+        borderPadding=8,
+        backColor=colors.HexColor('#f0f9ff'),
+        leftIndent=0,
+        rightIndent=0
+    )
+    
+    # Elements
+    elements = []
+    
+    # Header with Logo/Title
+    elements.append(Paragraph("🦷 Dental OPG AI Diagnostic System", title_style))
+    elements.append(Spacer(1, 0.15*inch))
+    elements.append(Paragraph("Clinical Analysis Report", subtitle_style))
+    elements.append(Spacer(1, 0.1*inch))
+    
+    # Horizontal Line
+    line = HRFlowable(width='100%', thickness=2, color=colors.HexColor('#4facfe'))
+    elements.append(line)
+    elements.append(Spacer(1, 0.2*inch))
+    
+    # Patient & Report Info
+    report_info = [
+        ['Patient ID:', current_user.username, 'Report Date:', datetime.now().strftime('%B %d, %Y')],
+        ['Scan Date:', scan.timestamp.strftime('%B %d, %Y'), 'Scan Time:', scan.timestamp.strftime('%I:%M %p')]
+    ]
+    
+    info_table = Table(report_info, colWidths=[1.2*inch, 2*inch, 1.2*inch, 2*inch])
+    info_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#e0f2fe')),
+        ('BACKGROUND', (2, 0), (2, -1), colors.HexColor('#e0f2fe')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#0f172a')),
+        ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('ALIGN', (2, 0), (2, -1), 'RIGHT'),
+        ('ALIGN', (3, 0), (3, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTNAME', (2, 0), (2, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e1'))
+    ]))
+    
+    elements.append(info_table)
+    elements.append(Spacer(1, 0.25*inch))
+    
+    # OPG Image Section
+    elements.append(Paragraph("📋 OPG X-Ray Scan", heading_style))
+    elements.append(Spacer(1, 0.08*inch))
+    
+    try:
+        image_filename = scan.image_path.split('/')[-1]
+        full_image_path = os.path.join(app.config['UPLOAD_FOLDER'], image_filename)
+        
+        if os.path.exists(full_image_path):
+            img = RLImage(full_image_path, width=5*inch, height=3.2*inch)
+            # Center the image using a table
+            img_container = Table([[img]], colWidths=[6*inch])
+            img_container.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (0, 0), 'CENTER'),
+                ('VALIGN', (0, 0), (0, 0), 'MIDDLE'),
+                ('TOPPADDING', (0, 0), (0, 0), 5),
+                ('BOTTOMPADDING', (0, 0), (0, 0), 5),
+            ]))
+            elements.append(img_container)
+            elements.append(Spacer(1, 0.2*inch))
+    except:
+        pass
+    
+    # Analysis Results
+    elements.append(Paragraph("🔍 Analysis Results", heading_style))
+    elements.append(Spacer(1, 0.08*inch))
+    
+    result_table = [
+        ['Predicted Classification:', scan.prediction],
+        ['Filename:', scan.filename]
+    ]
+    
+    result_table_obj = Table(result_table, colWidths=[2.2*inch, 3.8*inch])
+    result_table_obj.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#dcfce7')),
+        ('BACKGROUND', (1, 0), (1, -1), colors.HexColor('#f0fdf4')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#0f172a')),
+        ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+        ('TOPPADDING', (0, 0), (-1, -1), 10),
+        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e1'))
+    ]))
+    
+    elements.append(result_table_obj)
+    elements.append(Spacer(1, 0.25*inch))
+    
+    # Confidence Scores with Better Visualization
+    elements.append(Paragraph("📊 Confidence Analysis", heading_style))
+    elements.append(Spacer(1, 0.08*inch))
+    
+    confidence_data = [
+        ['Classification', 'Score', 'Confidence Level'],
+        ['Caries', f'{scan.caries_prob:.1f}%', _get_confidence_bar(scan.caries_prob)],
+        ['Decayed Tooth', f'{scan.decayed_prob:.1f}%', _get_confidence_bar(scan.decayed_prob)],
+        ['Ectopic Tooth', f'{scan.ectopic_prob:.1f}%', _get_confidence_bar(scan.ectopic_prob)],
+        ['Healthy Teeth', f'{scan.healthy_prob:.1f}%', _get_confidence_bar(scan.healthy_prob)]
+    ]
+    
+    conf_table = Table(confidence_data, colWidths=[1.8*inch, 1*inch, 2.2*inch])
+    conf_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4facfe')),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (0, 0), 'LEFT'),
+        ('ALIGN', (1, 0), (1, 0), 'CENTER'),
+        ('ALIGN', (2, 0), (2, 0), 'CENTER'),
+        ('ALIGN', (0, 1), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 1), (1, -1), 'CENTER'),
+        ('ALIGN', (2, 1), (2, -1), 'CENTER'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('FONTSIZE', (0, 1), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+        ('TOPPADDING', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+        ('TOPPADDING', (0, 1), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#cbd5e1')),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')])
+    ]))
+    
+    elements.append(conf_table)
+    elements.append(Spacer(1, 0.25*inch))
+    
+    # Classification Guide
+    elements.append(Paragraph("📚 Classification Guide", heading_style))
+    elements.append(Spacer(1, 0.08*inch))
+    
+    guide_data = [
+        ['Caries', 'Tooth decay and cavity formation in the dental structure'],
+        ['Decayed Tooth', 'Severely decayed or damaged teeth requiring dental intervention'],
+        ['Ectopic Tooth', 'Abnormally positioned or impacted teeth'],
+        ['Healthy Teeth', 'Normal, healthy tooth structures with no visible issues']
+    ]
+    
+    guide_table = Table(guide_data, colWidths=[1.5*inch, 4.5*inch])
+    guide_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (0, -1), colors.HexColor('#f0e7ff')),
+        ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#1e293b')),
+        ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+        ('ALIGN', (1, 0), (1, -1), 'LEFT'),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 9),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('TOPPADDING', (0, 0), (-1, -1), 8),
+        ('LEFTPADDING', (0, 0), (-1, -1), 6),
+        ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+        ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e9d5ff'))
+    ]))
+    
+    elements.append(guide_table)
+    elements.append(Spacer(1, 0.3*inch))
+    
+    # Disclaimer
+    disclaimer_style = ParagraphStyle(
+        'Disclaimer',
+        parent=styles['Normal'],
+        fontSize=8,
+        textColor=colors.HexColor('#92400e'),
+        alignment=0,
+        borderColor=colors.HexColor('#fbbf24'),
+        borderWidth=1,
+        borderPadding=12,
+        backColor=colors.HexColor('#fffbeb'),
+        leftIndent=8,
+        rightIndent=8,
+        spaceAfter=10
+    )
+    
+    disclaimer_text = """
+    <b>⚠️ IMPORTANT DISCLAIMER:</b> This AI diagnostic tool is intended for educational and research purposes only. 
+    It should not be used as a substitute for professional dental diagnosis or treatment. All results must be reviewed 
+    and validated by a qualified dental professional before any clinical use or patient communication.
+    """
+    elements.append(Paragraph(disclaimer_text, disclaimer_style))
+    
+    # Build PDF
+    doc.build(elements)
+    pdf_buffer.seek(0)
+    
+    return send_file(
+        pdf_buffer,
+        mimetype='application/pdf',
+        as_attachment=True,
+        download_name=f'dental_report_{scan.user.username}_{scan.timestamp.strftime("%Y%m%d_%H%M%S")}.pdf'
     )
 
 # ---------------- Run App ----------------
